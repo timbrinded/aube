@@ -1,9 +1,10 @@
 use super::dep_path::{
     parse_dep_path, peerless_alias_target, rewrite_peer_suffix, rewrite_snapshot_alias_deps,
-    version_to_dep_path,
+    strip_patch_hash_segments, version_to_dep_path,
 };
 use super::raw::{
-    RawBinSpec, RawDepSpec, RawRuntimeVariant, local_source_from_resolution, parse_raw_lockfile,
+    RawBinSpec, RawDepSpec, RawRuntimeVariant, RawSnapshot, local_source_from_resolution,
+    parse_raw_lockfile,
 };
 use crate::{
     CatalogEntry, DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph,
@@ -98,6 +99,13 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
                            name: &str,
                            info: &RawDepSpec,
                            dep_type: DepType| {
+        // pnpm suffixes a patched dep's `version:` with
+        // `(patch_hash=<sha256>)`. The graph keys packages by the
+        // canonical suffix-free dep_path (matching a fresh resolve);
+        // the writer re-inserts the segment from
+        // `patched_dependency_hashes`, so drop it before any
+        // classification or dep_path construction.
+        let version = strip_patch_hash_segments(&info.version);
         // pnpm appends a `(peer@ver)` suffix to the importer
         // `version:` of URL- and git-based direct deps when the
         // resolved snapshot carries peer context, the same way it
@@ -108,7 +116,7 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         // and the dep_path hash are both peer-context-free —
         // consistent with what `parse_dep_path` does for snapshot
         // keys downstream.
-        let classify_version = info.version.split('(').next().unwrap_or(&info.version);
+        let classify_version = version.split('(').next().unwrap_or(&version);
         if let Some(local) = LocalSource::parse(classify_version, Path::new("")) {
             // `Path::new("")` means tarball-vs-dir classification is
             // skipped; we default to Directory and rely on the
@@ -190,21 +198,13 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             // Strip any peer suffix before parsing so `version:
             // 18.2.0(react@18.2.0)` (a regular dep with peers) does
             // not parse as `name="18.2.0(react"`.
-            let bare_version = info
-                .version
-                .split('(')
-                .next()
-                .unwrap_or(info.version.as_str());
+            let bare_version = version.split('(').next().unwrap_or(version.as_str());
             let dep_path = if let Some((real_name, resolved)) = parse_dep_path(bare_version)
                 && real_name != name
             {
-                let peer_suffix = info
-                    .version
-                    .find('(')
-                    .map(|i| &info.version[i..])
-                    .unwrap_or("");
+                let peer_suffix = version.find('(').map(|i| &version[i..]).unwrap_or("");
                 let alias_dep_path = format!("{name}@{resolved}{peer_suffix}");
-                let real_dep_path = info.version.clone();
+                let real_dep_path = version.clone();
                 alias_remaps.push((
                     alias_dep_path.clone(),
                     real_dep_path,
@@ -213,7 +213,7 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
                 ));
                 alias_dep_path
             } else {
-                version_to_dep_path(name, &info.version)
+                version_to_dep_path(name, &version)
             };
             deps.push(DirectDep {
                 name: name.to_string(),
@@ -561,6 +561,15 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         let mut dependencies = snapshot
             .and_then(|s| s.dependencies.clone())
             .unwrap_or_default();
+        // Dep values referencing a patched package carry its
+        // `(patch_hash=…)` suffix; strip to the canonical form before
+        // the alias rewrite so both stay suffix-free on the graph.
+        for value in dependencies.values_mut() {
+            *value = strip_patch_hash_segments(value);
+        }
+        for value in optional_dependencies.values_mut() {
+            *value = strip_patch_hash_segments(value);
+        }
         rewrite_snapshot_alias_deps(&mut dependencies, &mut alias_remaps);
         rewrite_snapshot_alias_deps(&mut optional_dependencies, &mut alias_remaps);
         dependencies.extend(optional_dependencies.clone());
@@ -666,8 +675,12 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             ));
         }
 
+        // The graph keys a patched package by its canonical suffix-free
+        // dep_path; the writer re-derives the `(patch_hash=…)` segment
+        // from `patched_dependency_hashes`.
+        let graph_key = strip_patch_hash_segments(&dep_path);
         packages.insert(
-            dep_path.clone(),
+            graph_key.clone(),
             LockedPackage {
                 name,
                 version,
@@ -676,7 +689,7 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
                 optional_dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
-                dep_path,
+                dep_path: graph_key,
                 local_source,
                 os: os.into(),
                 cpu: cpu.into(),
@@ -848,12 +861,39 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         })
         .collect();
 
-    let patched_dependencies: BTreeMap<String, String> = raw
+    // Classify each `patchedDependencies` scalar before consuming the
+    // map: pnpm 11 writes the patch content hash as the scalar when
+    // the patch *path* lives in `pnpm-workspace.yaml`, while v8-style
+    // lockfiles wrote the path itself. The snapshot keys' matching
+    // `(patch_hash=…)` markers disambiguate.
+    let hash_only_patch_selectors: Vec<String> = raw
         .patched_dependencies
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v.into_path()))
-        .collect();
+        .as_ref()
+        .map(|patched| {
+            patched
+                .iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .scalar_value()
+                        .is_some_and(|value| scalar_is_patch_hash(value, &raw.snapshots))
+                })
+                .map(|(selector, _)| selector.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in raw.patched_dependencies.unwrap_or_default() {
+        let scalar_is_hash = hash_only_patch_selectors.contains(&k);
+        let (patch_path, patch_hash) = v.into_path_and_hash(scalar_is_hash);
+        if let Some(hash) = patch_hash {
+            patched_dependency_hashes.insert(k.clone(), hash);
+        }
+        if let Some(patch_path) = patch_path {
+            patched_dependencies.insert(k, patch_path);
+        }
+    }
 
     // Lift the synthetic runtime importer deps recorded above into
     // typed pins, pulling the per-platform artifact list out of the
@@ -903,11 +943,27 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         catalogs,
         bun_config_version: None,
         patched_dependencies,
+        patched_dependency_hashes,
         trusted_dependencies: Vec::new(),
         runtimes,
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     })
+}
+
+/// A `patchedDependencies` scalar is pnpm 11's hash-only form when it
+/// looks like a sha256 hex digest AND some snapshot key carries the
+/// matching `(patch_hash=<value>)` marker. Matched with `contains`
+/// rather than a selector-prefix check so bare-name selectors (`ms:`)
+/// classify too. A 64-hex *path* that never shows up as a snapshot
+/// marker keeps the path interpretation, so v8-style lockfiles stay
+/// byte-stable.
+fn scalar_is_patch_hash(value: &str, snapshots: &BTreeMap<String, RawSnapshot>) -> bool {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let marker = format!("(patch_hash={value})");
+    snapshots.keys().any(|key| key.contains(&marker))
 }
 
 fn tarball_url_needs_preserve(url: &str) -> bool {

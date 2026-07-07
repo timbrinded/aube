@@ -2668,6 +2668,11 @@ snapshots:
         "patches/is-odd@3.0.1.patch"
     );
     assert_eq!(
+        graph.patched_dependency_hashes.get("is-odd@3.0.1").unwrap(),
+        "sha256-deadbeef",
+        "the object form's hash must be retained on the graph"
+    );
+    assert_eq!(
         graph.catalogs["evens"]["is-even"].specifier, "^1.0.0",
         "named catalogs must survive parse"
     );
@@ -2740,6 +2745,8 @@ snapshots:
         "lockfileIncludeTarballUrl: true",
         "overrides:",
         "patchedDependencies:",
+        "hash: sha256-deadbeef",
+        "path: patches/is-odd@3.0.1.patch",
         "catalogs:",
         "skippedOptionalDependencies:",
         "ignoredOptionalDependencies:",
@@ -2783,6 +2790,13 @@ snapshots:
             .get("is-odd@3.0.1")
             .unwrap_or_else(|| panic!("patched deps lost after reparse:\n{written}")),
         "patches/is-odd@3.0.1.patch"
+    );
+    assert_eq!(
+        reparsed
+            .patched_dependency_hashes
+            .get("is-odd@3.0.1")
+            .unwrap_or_else(|| panic!("patch hash lost after reparse:\n{written}")),
+        "sha256-deadbeef"
     );
     assert_eq!(reparsed.catalogs["default"]["react"].version, "18.2.0");
     assert_eq!(
@@ -4188,4 +4202,461 @@ fn runtime_pin_drift_detection() {
         no_pin.check_drift(&manifest_with("^24.4.0"), &empty, &[], &empty_catalogs),
         DriftStatus::Fresh
     );
+}
+
+// ---- pnpm patched-dependency hash preservation ----------------------
+
+const MS_PATCH_HASH: &str = "46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266";
+
+/// Byte-for-byte copy of a pnpm 11.3.0 lockfile for a project whose
+/// patch path lives in `pnpm-workspace.yaml#patchedDependencies` — the
+/// top-level block records only the patch content hash as a scalar,
+/// and the dependent's snapshot dep value carries the
+/// `(patch_hash=…)` suffix.
+const PNPM11_HASH_SCALAR_LOCKFILE: &str = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+patchedDependencies:
+  ms@2.1.3: 46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266
+
+importers:
+
+  .:
+    dependencies:
+      debug:
+        specifier: 4.3.7
+        version: 4.3.7
+
+packages:
+
+  debug@4.3.7:
+    resolution: {integrity: sha512-Er2nc/H7RrMXZBFCEim6TCmMk02Z8vLC2Rbi1KEBggpo0fS6l0S1nnapwmIi3yW/+GOJap1Krg4w0Hg80oCqgQ==}
+    engines: {node: '>=6.0'}
+    peerDependencies:
+      supports-color: '*'
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+
+  ms@2.1.3:
+    resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
+
+snapshots:
+
+  debug@4.3.7:
+    dependencies:
+      ms: 2.1.3(patch_hash=46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266)
+
+  ms@2.1.3(patch_hash=46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266): {}
+"#;
+
+/// Same project shape written by pnpm 10 with the patch declared in
+/// `package.json#pnpm.patchedDependencies` — the block carries the
+/// `{ hash, path }` object (hash first) and the direct dep's importer
+/// `version:` carries the suffix.
+const PNPM10_OBJECT_LOCKFILE: &str = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+patchedDependencies:
+  ms@2.1.3:
+    hash: 46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266
+    path: patches/ms@2.1.3.patch
+
+importers:
+
+  .:
+    dependencies:
+      ms:
+        specifier: 2.1.3
+        version: 2.1.3(patch_hash=46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266)
+
+packages:
+
+  ms@2.1.3:
+    resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
+
+snapshots:
+
+  ms@2.1.3(patch_hash=46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266): {}
+"#;
+
+fn write_and_read_back(graph: &LockfileGraph, manifest: &PackageJson) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("pnpm-lock.yaml");
+    write(&out, graph, manifest).unwrap();
+    std::fs::read_to_string(&out).unwrap()
+}
+
+#[test]
+fn hash_only_patched_dependency_scalar_classifies_as_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, PNPM11_HASH_SCALAR_LOCKFILE).unwrap();
+
+    let graph = parse(&path).unwrap();
+
+    // The scalar is the patch content hash, not a path — the path
+    // lives in pnpm-workspace.yaml and never enters the lockfile.
+    assert!(
+        !graph.patched_dependencies.contains_key("ms@2.1.3"),
+        "hash scalar must not be misread as a patch path: {:?}",
+        graph.patched_dependencies
+    );
+    assert_eq!(
+        graph.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
+        MS_PATCH_HASH
+    );
+    // Graph keys are canonical (suffix-free), matching a fresh resolve.
+    assert!(graph.packages.contains_key("ms@2.1.3"));
+    assert!(
+        !graph.packages.keys().any(|k| k.contains("patch_hash")),
+        "patch_hash suffixes must be stripped from graph keys: {:?}",
+        graph.packages.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        graph.packages.get("debug@4.3.7").unwrap().dependencies["ms"],
+        "2.1.3",
+        "snapshot dep values must be suffix-free on the graph"
+    );
+}
+
+#[test]
+fn pnpm11_hash_scalar_lockfile_roundtrips_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, PNPM11_HASH_SCALAR_LOCKFILE).unwrap();
+    let graph = parse(&path).unwrap();
+
+    let manifest = PackageJson {
+        name: Some("depval".to_string()),
+        dependencies: [("debug".to_string(), "4.3.7".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+    assert_eq!(
+        written, PNPM11_HASH_SCALAR_LOCKFILE,
+        "pnpm 11 hash-only scalar lockfile must round-trip byte-identically"
+    );
+}
+
+#[test]
+fn pnpm10_object_patched_dependencies_roundtrip_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, PNPM10_OBJECT_LOCKFILE).unwrap();
+    let graph = parse(&path).unwrap();
+
+    // Object form populates both maps.
+    assert_eq!(
+        graph.patched_dependencies.get("ms@2.1.3").unwrap(),
+        "patches/ms@2.1.3.patch"
+    );
+    assert_eq!(
+        graph.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
+        MS_PATCH_HASH
+    );
+
+    let manifest = PackageJson {
+        name: Some("obj".to_string()),
+        dependencies: [("ms".to_string(), "2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+    assert_eq!(
+        written, PNPM10_OBJECT_LOCKFILE,
+        "pnpm 10 {{hash, path}} object entries must round-trip byte-identically"
+    );
+}
+
+#[test]
+fn patch_hash_suffixes_survive_re_resolve_overlay() {
+    // The `aube add` regression shape: a fresh resolve produces
+    // suffix-free dep paths and empty patch maps; only
+    // `overlay_metadata_from(prior)` carries the patch state back in.
+    // The written output must still restore every `(patch_hash=…)`
+    // position, byte-identical to what pnpm 11 wrote.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, PNPM11_HASH_SCALAR_LOCKFILE).unwrap();
+    let prior = parse(&path).unwrap();
+
+    let mut fresh = LockfileGraph {
+        settings: crate::LockfileSettings {
+            auto_install_peers: true,
+            exclude_links_from_lockfile: false,
+            lockfile_include_tarball_url: false,
+        },
+        ..Default::default()
+    };
+    fresh.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "debug".to_string(),
+            dep_path: "debug@4.3.7".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("4.3.7".to_string()),
+        }],
+    );
+    for key in ["debug@4.3.7", "ms@2.1.3"] {
+        let prior_pkg = prior.packages.get(key).unwrap();
+        fresh.packages.insert(key.to_string(), prior_pkg.clone());
+    }
+    assert!(fresh.patched_dependency_hashes.is_empty());
+
+    fresh.overlay_metadata_from(&prior);
+    assert_eq!(
+        fresh.patched_dependency_hashes.get("ms@2.1.3").unwrap(),
+        MS_PATCH_HASH,
+        "overlay must carry hash-only patch entries even though patched_dependencies is empty"
+    );
+
+    let manifest = PackageJson {
+        name: Some("depval".to_string()),
+        dependencies: [("debug".to_string(), "4.3.7".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&fresh, &manifest);
+    assert_eq!(
+        written, PNPM11_HASH_SCALAR_LOCKFILE,
+        "re-resolved graph + overlay must not drop patch_hash suffixes"
+    );
+}
+
+#[test]
+fn patch_hash_segment_precedes_peer_suffix_on_write() {
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "peer-host".to_string(),
+            dep_path: "peer-host@1.0.0(@types/node@20.11.0)".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".to_string()),
+        }],
+    );
+    graph.packages.insert(
+        "peer-host@1.0.0(@types/node@20.11.0)".to_string(),
+        LockedPackage {
+            name: "peer-host".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-peer".to_string()),
+            dep_path: "peer-host@1.0.0(@types/node@20.11.0)".to_string(),
+            peer_dependencies: [("@types/node".to_string(), ">=20".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        },
+    );
+    graph.packages.insert(
+        "@types/node@20.11.0".to_string(),
+        LockedPackage {
+            name: "@types/node".to_string(),
+            version: "20.11.0".to_string(),
+            integrity: Some("sha512-types".to_string()),
+            dep_path: "@types/node@20.11.0".to_string(),
+            ..Default::default()
+        },
+    );
+    graph.patched_dependencies.insert(
+        "peer-host@1.0.0".to_string(),
+        "patches/peer-host@1.0.0.patch".to_string(),
+    );
+    graph
+        .patched_dependency_hashes
+        .insert("peer-host@1.0.0".to_string(), MS_PATCH_HASH.to_string());
+
+    let manifest = PackageJson {
+        name: Some("peer-patch".to_string()),
+        dependencies: [("peer-host".to_string(), "1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+
+    // pnpm emits the patch_hash segment before peer segments.
+    assert!(
+        written.contains(&format!(
+            "version: 1.0.0(patch_hash={MS_PATCH_HASH})(@types/node@20.11.0)"
+        )),
+        "importer version must carry patch_hash before the peer suffix:\n{written}"
+    );
+    assert!(
+        written.contains(&format!(
+            "\n  peer-host@1.0.0(patch_hash={MS_PATCH_HASH})(@types/node@20.11.0):"
+        )),
+        "snapshot key must carry patch_hash before the peer suffix:\n{written}"
+    );
+}
+
+#[test]
+fn bare_name_patch_selector_suffixes_matching_package() {
+    // pnpm-workspace.yaml accepts a bare-name selector (`ms:`); the
+    // lockfile then records the hash under the bare name and the
+    // suffix still lands on the versioned dep path.
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "ms".to_string(),
+            dep_path: "ms@2.1.3".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("2.1.3".to_string()),
+        }],
+    );
+    graph.packages.insert(
+        "ms@2.1.3".to_string(),
+        LockedPackage {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: Some("sha512-ms".to_string()),
+            dep_path: "ms@2.1.3".to_string(),
+            ..Default::default()
+        },
+    );
+    graph
+        .patched_dependency_hashes
+        .insert("ms".to_string(), MS_PATCH_HASH.to_string());
+
+    let manifest = PackageJson {
+        name: Some("bare".to_string()),
+        dependencies: [("ms".to_string(), "2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+    assert!(
+        written.contains(&format!("version: 2.1.3(patch_hash={MS_PATCH_HASH})")),
+        "bare-name selector must still suffix the versioned dep path:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("\n  ms: {MS_PATCH_HASH}\n")),
+        "bare-name hash scalar must round-trip:\n{written}"
+    );
+}
+
+#[test]
+fn v8_path_scalar_patched_dependencies_stay_byte_stable() {
+    // v8-style lockfiles record the patch *path* as the scalar and
+    // carry no `(patch_hash=…)` markers anywhere. Preserve-only means
+    // no hashes or suffixes may appear on rewrite.
+    let yaml = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+patchedDependencies:
+  ms@2.1.3: patches/ms@2.1.3.patch
+
+importers:
+
+  .:
+    dependencies:
+      ms:
+        specifier: 2.1.3
+        version: 2.1.3
+
+packages:
+
+  ms@2.1.3:
+    resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
+
+snapshots:
+
+  ms@2.1.3: {}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let graph = parse(&path).unwrap();
+
+    assert_eq!(
+        graph.patched_dependencies.get("ms@2.1.3").unwrap(),
+        "patches/ms@2.1.3.patch"
+    );
+    assert!(graph.patched_dependency_hashes.is_empty());
+
+    let manifest = PackageJson {
+        name: Some("v8".to_string()),
+        dependencies: [("ms".to_string(), "2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+    assert_eq!(
+        written, yaml,
+        "path-scalar lockfiles must not gain hashes or suffixes"
+    );
+    assert!(!written.contains("patch_hash"));
+}
+
+#[test]
+fn hash_like_scalar_without_snapshot_marker_roundtrips_as_scalar() {
+    // A 64-hex scalar with no matching `(patch_hash=…)` snapshot
+    // marker (unused patch) keeps the path interpretation — and either
+    // way the block round-trips byte-identically.
+    let yaml = format!(
+        r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+patchedDependencies:
+  ms@2.1.3: {MS_PATCH_HASH}
+
+importers:
+
+  .:
+    dependencies:
+      ms:
+        specifier: 2.1.3
+        version: 2.1.3
+
+packages:
+
+  ms@2.1.3:
+    resolution: {{integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}}
+
+snapshots:
+
+  ms@2.1.3: {{}}
+"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, &yaml).unwrap();
+    let graph = parse(&path).unwrap();
+
+    assert_eq!(
+        graph.patched_dependencies.get("ms@2.1.3").unwrap(),
+        MS_PATCH_HASH,
+        "no snapshot marker → scalar stays a path"
+    );
+    assert!(graph.patched_dependency_hashes.is_empty());
+
+    let manifest = PackageJson {
+        name: Some("unused".to_string()),
+        dependencies: [("ms".to_string(), "2.1.3".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let written = write_and_read_back(&graph, &manifest);
+    assert_eq!(written, yaml);
 }

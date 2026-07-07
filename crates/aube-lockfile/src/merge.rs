@@ -266,6 +266,24 @@ fn merge_into(dst: &mut LockfileGraph, src: LockfileGraph, report: &mut MergeRep
             }
         }
     }
+    for (key, incoming) in src.patched_dependency_hashes {
+        use std::collections::btree_map::Entry;
+        match dst.patched_dependency_hashes.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(incoming);
+            }
+            Entry::Occupied(slot) => {
+                if slot.get() != &incoming {
+                    report.conflicts.push(format!(
+                        "patched dependency hash `{}`: kept {} over {}",
+                        slot.key(),
+                        slot.get(),
+                        incoming
+                    ));
+                }
+            }
+        }
+    }
     for (name, incoming) in src.runtimes {
         use std::collections::btree_map::Entry;
         match dst.runtimes.entry(name) {
@@ -603,6 +621,30 @@ mod tests {
             dst.patched_dependencies.contains_key("lodash@4.17.21"),
             "patched_dependencies entry was dropped on merge: {:?}",
             dst.patched_dependencies
+        );
+    }
+
+    #[test]
+    fn merge_into_preserves_patched_dependency_hashes_and_reports_conflicts() {
+        let mut dst = LockfileGraph::default();
+        dst.patched_dependency_hashes
+            .insert("lodash@4.17.21".into(), "aaaa".into());
+        let mut src = LockfileGraph::default();
+        src.patched_dependency_hashes
+            .insert("lodash@4.17.21".into(), "bbbb".into());
+        src.patched_dependency_hashes
+            .insert("ms@2.1.3".into(), "cccc".into());
+        let mut report = MergeReport::default();
+        merge_into(&mut dst, src, &mut report);
+        assert_eq!(dst.patched_dependency_hashes["lodash@4.17.21"], "aaaa");
+        assert_eq!(dst.patched_dependency_hashes["ms@2.1.3"], "cccc");
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.contains("patched dependency hash `lodash@4.17.21`")),
+            "conflicting hash must be reported: {:?}",
+            report.conflicts
         );
     }
 

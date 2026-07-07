@@ -1,5 +1,6 @@
 use super::dep_path::{
-    dep_path_tail, parse_dep_path, peerless_dep_path, rewrite_peer_suffix, version_to_dep_path,
+    dep_path_tail, insert_patch_hash_segment, parse_dep_path, peerless_dep_path,
+    rewrite_peer_suffix, version_to_dep_path,
 };
 use super::format::reformat_for_pnpm_parity;
 use crate::{DepType, Error, LocalSource, LockfileGraph};
@@ -33,6 +34,24 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             }
             _ => None,
         }
+    };
+    // Recover the `(patch_hash=…)` dep-path segment pnpm appends to a
+    // patched package's importer version, snapshot key, and snapshot
+    // dep values. The graph keys packages suffix-free (the reader
+    // strips the segment), so the writer re-derives it here. An exact
+    // `name@version` selector wins over a bare-name selector,
+    // mirroring pnpm's patch lookup precedence. Preserve-only: hashes
+    // exist on the graph only when the parsed lockfile carried them,
+    // so v8-style path-only lockfiles never gain suffixes.
+    let patch_hash_for = |name: &str, version: &str| -> Option<&str> {
+        if graph.patched_dependency_hashes.is_empty() {
+            return None;
+        }
+        graph
+            .patched_dependency_hashes
+            .get(&format!("{name}@{version}"))
+            .or_else(|| graph.patched_dependency_hashes.get(name))
+            .map(String::as_str)
     };
     let mut importers = BTreeMap::new();
     let exclude_links = graph.settings.exclude_links_from_lockfile;
@@ -97,12 +116,16 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             } else {
                 // Registry dep: the tail may carry a `(git/tarball@hash)`
                 // peer suffix that must render as the resolved spec.
-                rewrite_peer_suffix(
-                    dep.dep_path
-                        .strip_prefix(&format!("{}@", dep.name))
-                        .unwrap_or(&dep.dep_path),
-                    &peer_suffix_to_spec,
-                )
+                let tail = dep
+                    .dep_path
+                    .strip_prefix(&format!("{}@", dep.name))
+                    .unwrap_or(&dep.dep_path);
+                let version = rewrite_peer_suffix(tail, &peer_suffix_to_spec);
+                let bare = tail.split('(').next().unwrap_or(tail);
+                match patch_hash_for(&dep.name, bare) {
+                    Some(hash) => insert_patch_hash_segment(&version, hash),
+                    None => version,
+                }
             };
 
             let spec = WritableDepSpec {
@@ -545,7 +568,13 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     // Registry dep whose value may carry a
                     // `(git/tarball@hash)` peer suffix — render the suffix
                     // as the resolved spec (`1.1.4(request@https://…)`).
-                    (name, rewrite_peer_suffix(&value, &peer_suffix_to_spec))
+                    let rewritten = rewrite_peer_suffix(&value, &peer_suffix_to_spec);
+                    let bare = value.split('(').next().unwrap_or(&value);
+                    let rewritten = match patch_hash_for(&name, bare) {
+                        Some(hash) => insert_patch_hash_segment(&rewritten, hash),
+                        None => rewritten,
+                    };
+                    (name, rewritten)
                 }
             })
             .collect()
@@ -567,7 +596,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     // Registry snapshot key whose `(git/tarball@hash)` peer
                     // suffix must render as the resolved spec to match pnpm
                     // (`request-promise-core@1.1.4(request@https://…)`).
-                    rewrite_peer_suffix(dep_path, &peer_suffix_to_spec)
+                    let key = rewrite_peer_suffix(dep_path, &peer_suffix_to_spec);
+                    match patch_hash_for(&pkg.name, &pkg.version) {
+                        Some(hash) => insert_patch_hash_segment(&key, hash),
+                        None => key,
+                    }
                 }
             }
         };
@@ -677,14 +710,37 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     .collect(),
             )
         },
-        // pnpm v9 emits patched deps as `{ path, hash }`. We don't
-        // track the patch hash on the graph (install-time concern),
-        // so write the path form which pnpm still accepts. Skipped
-        // when empty to keep parity with no-patch installs.
-        patched_dependencies: if graph.patched_dependencies.is_empty() {
-            None
-        } else {
-            Some(graph.patched_dependencies.clone())
+        // pnpm 9/10 emit manifest-declared patched deps as
+        // `{ hash, path }`; pnpm 11 writes a hash-only scalar when the
+        // path lives in `pnpm-workspace.yaml`, and v8-style lockfiles
+        // carried a bare path scalar. Re-emit whichever shape the graph
+        // carries so none of the three round-trips churn. Skipped when
+        // empty to keep parity with no-patch installs.
+        patched_dependencies: {
+            let mut entries: BTreeMap<String, WritablePatchedDependency> = graph
+                .patched_dependencies
+                .iter()
+                .map(|(selector, patch_path)| {
+                    let entry = match graph.patched_dependency_hashes.get(selector) {
+                        Some(hash) => WritablePatchedDependency::WithHash {
+                            hash: hash.clone(),
+                            path: patch_path.clone(),
+                        },
+                        None => WritablePatchedDependency::Scalar(patch_path.clone()),
+                    };
+                    (selector.clone(), entry)
+                })
+                .collect();
+            for (selector, hash) in &graph.patched_dependency_hashes {
+                entries
+                    .entry(selector.clone())
+                    .or_insert_with(|| WritablePatchedDependency::Scalar(hash.clone()));
+            }
+            if entries.is_empty() {
+                None
+            } else {
+                Some(entries)
+            }
         },
         time,
         importers,
@@ -813,7 +869,7 @@ struct WritablePnpmLockfile {
     /// after `pnpmfileChecksum:` and before `importers:`, so the field
     /// order here follows the same sequence for byte-identical output.
     #[serde(skip_serializing_if = "Option::is_none")]
-    patched_dependencies: Option<BTreeMap<String, String>>,
+    patched_dependencies: Option<BTreeMap<String, WritablePatchedDependency>>,
     /// pnpm v9 emits a top-level `time:` map when `resolution-mode=time-based`
     /// is active. Keyed by canonical `name@version`; values are ISO-8601
     /// publish timestamps pulled from the registry packument. Placed
@@ -867,6 +923,18 @@ struct WritableImporter {
 struct WritableDepSpec {
     specifier: String,
     version: String,
+}
+
+/// One `patchedDependencies:` entry. pnpm 9/10 write the nested
+/// `{ hash, path }` object (hash first) for manifest-declared patches;
+/// pnpm 11 writes a bare hash scalar when the path lives in
+/// `pnpm-workspace.yaml`, and v8-style lockfiles carried a bare path
+/// scalar — both scalar flavors serialize through `Scalar`.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WritablePatchedDependency {
+    WithHash { hash: String, path: String },
+    Scalar(String),
 }
 
 #[derive(Debug, Serialize)]

@@ -1028,6 +1028,12 @@ mod subset_tests {
                 "patchedDependencies-block",
                 "lockfileVersion: '9.0'\npatchedDependencies:\n  foo@1.0.0:\n    path: patches/foo.patch\n    hash: abc123\n",
             ),
+            // pnpm 11 hash-only scalar (path lives in pnpm-workspace.yaml)
+            // plus the matching `(patch_hash=…)`-suffixed snapshot key.
+            (
+                "patchedDependencies-hash-scalar",
+                "lockfileVersion: '9.0'\npatchedDependencies:\n  foo@1.0.0: 46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266\nsnapshots:\n  foo@1.0.0(patch_hash=46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266): {}\n",
+            ),
             (
                 "catalogs-block",
                 "lockfileVersion: '9.0'\ncatalogs:\n  default:\n    react:\n      specifier: ^18\n      version: 18.0.0\n",
