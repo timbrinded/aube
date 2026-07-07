@@ -1486,6 +1486,9 @@ async fn merge_update_graph_into_workspace_lockfile(
     root_graph
         .patched_dependencies
         .extend(pkg_graph.patched_dependencies);
+    root_graph
+        .patched_dependency_hashes
+        .extend(pkg_graph.patched_dependency_hashes);
     for trusted in pkg_graph.trusted_dependencies {
         if !root_graph.trusted_dependencies.contains(&trusted) {
             root_graph.trusted_dependencies.push(trusted);

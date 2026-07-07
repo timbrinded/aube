@@ -240,3 +240,38 @@ proptest! {
         prop_assert_eq!(roundtrip(&graph, &manifest, LockfileKind::YarnBerry), normalize(&graph));
     }
 }
+
+fn patch_hash_strategy() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[0-9a-f]{64}").unwrap()
+}
+
+proptest! {
+    // pnpm 9+ records patch state as hash-only scalars plus
+    // `(patch_hash=…)` dep-path suffixes. The writer re-derives every
+    // suffix position from `patched_dependency_hashes` and the parser
+    // classifies the scalars back — the pair must be a fixed point for
+    // any registry graph and any set of sha256 hashes.
+    #[test]
+    fn pnpm_patched_dependency_hashes_roundtrip(
+        shape in graph_shapes(),
+        hashes in proptest::collection::vec(patch_hash_strategy(), 1..4),
+    ) {
+        let (mut graph, manifest) = graph_from_shape(shape);
+        let keys: Vec<String> = graph.packages.keys().cloned().collect();
+        for (key, hash) in keys.iter().zip(hashes.iter()) {
+            graph
+                .patched_dependency_hashes
+                .insert(key.clone(), hash.clone());
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        aube_lockfile::write_lockfile_as(dir.path(), &graph, &manifest, LockfileKind::Pnpm)
+            .expect("write lockfile");
+        let reparsed = aube_lockfile::parse_lockfile(dir.path(), &manifest).expect("parse lockfile");
+        // Hash-only scalars must classify back as hashes, not paths…
+        prop_assert_eq!(&reparsed.patched_dependency_hashes, &graph.patched_dependency_hashes);
+        prop_assert!(reparsed.patched_dependencies.is_empty());
+        // …and the suffixed snapshot keys must strip back to the same graph.
+        prop_assert_eq!(roundtrip(&graph, &manifest, LockfileKind::Pnpm), normalize(&graph));
+    }
+}

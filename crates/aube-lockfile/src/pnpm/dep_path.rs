@@ -211,6 +211,124 @@ pub(super) fn rewrite_snapshot_alias_deps(
     }
 }
 
+/// Drop every `(patch_hash=…)` segment from a dep_path (or a headless
+/// dep *value*), at any nesting depth, preserving all other segments
+/// verbatim. pnpm 9+ appends the patch content hash to a patched
+/// package's dep path (`ms@2.1.3(patch_hash=<sha256>)`); the graph
+/// keys packages by the canonical suffix-free path (matching what a
+/// fresh resolve produces), so the reader strips the segment and the
+/// writer re-inserts it from `graph.patched_dependency_hashes`.
+///
+/// Unbalanced tails are preserved verbatim, mirroring
+/// [`rewrite_peer_suffix`] — but silently, since the peer machinery
+/// warns on the same string later in the parse.
+pub(super) fn strip_patch_hash_segments(s: &str) -> String {
+    if !s.contains("(patch_hash=") {
+        return s.to_string();
+    }
+    let Some(head_end) = s.find('(') else {
+        return s.to_string();
+    };
+    let segments = outer_paren_segments(&s[head_end..]);
+    if segments.is_empty() {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..head_end]);
+    for seg in segments {
+        let inner = &seg[1..seg.len() - 1];
+        if inner.starts_with("patch_hash=") {
+            continue;
+        }
+        out.push('(');
+        out.push_str(&strip_patch_hash_segments(inner));
+        out.push(')');
+    }
+    out
+}
+
+/// Insert `(patch_hash=<hash>)` immediately after the version head,
+/// before any peer-suffix segments — pnpm emits the patch_hash segment
+/// first: `2.1.3` → `2.1.3(patch_hash=H)`, `1.0.0(react@18.2.0)` →
+/// `1.0.0(patch_hash=H)(react@18.2.0)`.
+pub(super) fn insert_patch_hash_segment(s: &str, hash: &str) -> String {
+    let head_end = s.find('(').unwrap_or(s.len());
+    format!("{}(patch_hash={hash}){}", &s[..head_end], &s[head_end..])
+}
+
+#[cfg(test)]
+mod patch_hash_segment_tests {
+    use super::{insert_patch_hash_segment, strip_patch_hash_segments};
+
+    const HASH: &str = "46fc164b4bba9329de0ada5cfe7f18a18ed08a32de0662e6c8694b6be5beb266";
+
+    #[test]
+    fn strip_is_noop_without_patch_hash() {
+        let s = "react-dom@18.2.0(react@18.2.0)";
+        assert_eq!(strip_patch_hash_segments(s), s);
+        assert_eq!(strip_patch_hash_segments("lodash@4.18.1"), "lodash@4.18.1");
+    }
+
+    #[test]
+    fn strip_removes_flat_segment() {
+        assert_eq!(
+            strip_patch_hash_segments(&format!("ms@2.1.3(patch_hash={HASH})")),
+            "ms@2.1.3"
+        );
+        // Headless dep-value form.
+        assert_eq!(
+            strip_patch_hash_segments(&format!("2.1.3(patch_hash={HASH})")),
+            "2.1.3"
+        );
+    }
+
+    #[test]
+    fn strip_keeps_peer_segments_around_the_patch_segment() {
+        assert_eq!(
+            strip_patch_hash_segments(&format!("pkg@1.0.0(patch_hash={HASH})(react@18.2.0)")),
+            "pkg@1.0.0(react@18.2.0)"
+        );
+    }
+
+    #[test]
+    fn strip_recurses_into_nested_peer_references() {
+        assert_eq!(
+            strip_patch_hash_segments(&format!(
+                "consumer@1.0.0(dep@2.0.0(patch_hash={HASH})(react@18.2.0))"
+            )),
+            "consumer@1.0.0(dep@2.0.0(react@18.2.0))"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_unbalanced_tails_verbatim() {
+        let s = "ms@2.1.3(patch_hash=abc";
+        assert_eq!(strip_patch_hash_segments(s), s);
+    }
+
+    #[test]
+    fn insert_places_segment_before_peer_suffix() {
+        assert_eq!(
+            insert_patch_hash_segment("2.1.3", HASH),
+            format!("2.1.3(patch_hash={HASH})")
+        );
+        assert_eq!(
+            insert_patch_hash_segment("pkg@1.0.0(react@18.2.0)", HASH),
+            format!("pkg@1.0.0(patch_hash={HASH})(react@18.2.0)")
+        );
+    }
+
+    #[test]
+    fn strip_inverts_insert() {
+        for s in ["2.1.3", "ms@2.1.3", "pkg@1.0.0(react@18.2.0)"] {
+            assert_eq!(
+                strip_patch_hash_segments(&insert_patch_hash_segment(s, HASH)),
+                s
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod rewrite_peer_suffix_tests {
     use super::rewrite_peer_suffix;

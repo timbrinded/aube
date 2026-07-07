@@ -123,6 +123,15 @@ pub struct LockfileGraph {
     /// verbatim so a parse/write cycle doesn't silently drop user
     /// patches from the lockfile.
     pub patched_dependencies: BTreeMap<String, String>,
+    /// Patch content hashes pnpm 9+ records alongside
+    /// `patchedDependencies`, keyed by the same selector. pnpm 11 may
+    /// record a hash-only scalar when the patch path lives in
+    /// `pnpm-workspace.yaml`, so a selector can appear here without a
+    /// `patched_dependencies` entry. Preserve-only: carried from the
+    /// parsed lockfile, never computed. Consumed by the pnpm writer to
+    /// re-emit `(patch_hash=…)` dep-path suffixes and the `{hash, path}`
+    /// block; other format writers ignore it.
+    pub patched_dependency_hashes: BTreeMap<String, String>,
     /// Top-level `trustedDependencies:` block (bun) — a package-name
     /// allowlist for lifecycle script execution. Preserved so
     /// re-emitting a bun.lock doesn't strip the allowlist and cause
@@ -717,6 +726,7 @@ impl LockfileGraph {
             catalogs: self.catalogs.clone(),
             bun_config_version: self.bun_config_version,
             patched_dependencies: self.patched_dependencies.clone(),
+            patched_dependency_hashes: self.patched_dependency_hashes.clone(),
             trusted_dependencies: self.trusted_dependencies.clone(),
             // Runtime pins are graph-wide resolution intent, same as
             // overrides/catalogs — structural filters carry them.
@@ -785,6 +795,7 @@ impl LockfileGraph {
             catalogs: self.catalogs.clone(),
             bun_config_version: self.bun_config_version,
             patched_dependencies: self.patched_dependencies.clone(),
+            patched_dependency_hashes: self.patched_dependency_hashes.clone(),
             trusted_dependencies: self.trusted_dependencies.clone(),
             runtimes: self.runtimes.clone(),
             extra_fields: self.extra_fields.clone(),
@@ -835,6 +846,12 @@ impl LockfileGraph {
         }
         if self.patched_dependencies.is_empty() {
             self.patched_dependencies = prior.patched_dependencies.clone();
+        }
+        // Independent of the paths guard: a pnpm 11 hash-only lockfile
+        // has an empty `patched_dependencies` map but a populated
+        // hashes map, so each fills from `prior` on its own.
+        if self.patched_dependency_hashes.is_empty() {
+            self.patched_dependency_hashes = prior.patched_dependency_hashes.clone();
         }
         if self.trusted_dependencies.is_empty() {
             self.trusted_dependencies = prior.trusted_dependencies.clone();
